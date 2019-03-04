@@ -21,10 +21,11 @@ import sys
 
 from math import pow
 from time import sleep
+from datetime import datetime, timedelta
 
 from airflow.exceptions import AirflowException
 from airflow.models import BaseOperator
-from airflow.utils.decorators import apply_defaults
+from airflow.utils import apply_defaults
 
 from airflow.contrib.hooks.aws_hook import AwsHook
 
@@ -33,7 +34,7 @@ class AWSBatchOperator(BaseOperator):
     """
     Execute a job on AWS Batch Service
 
-    .. warning: the queue parameter was renamed to job_queue to segregate the
+    .. warning: the queue parameter was renamed to job_queue to segreggate the
                 internal CeleryExecutor queue from the AWS Batch internal queue.
 
     :param job_name: the name for the job that will run on AWS Batch (templated)
@@ -61,7 +62,7 @@ class AWSBatchOperator(BaseOperator):
     ui_color = '#c3dae0'
     client = None
     arn = None
-    template_fields = ('job_name', 'overrides',)
+#    template_fields = ('overrides',)
 
     @apply_defaults
     def __init__(self, job_name, job_definition, job_queue, overrides, max_retries=4200,
@@ -75,7 +76,7 @@ class AWSBatchOperator(BaseOperator):
         self.job_queue = job_queue
         self.overrides = overrides
         self.max_retries = max_retries
-
+        self.execution_timeout = kwargs.get('execution_timeout', timedelta(seconds=3600))
         self.jobId = None
         self.jobName = None
 
@@ -98,7 +99,11 @@ class AWSBatchOperator(BaseOperator):
                 jobName=self.job_name,
                 jobQueue=self.job_queue,
                 jobDefinition=self.job_definition,
-                containerOverrides=self.overrides)
+                containerOverrides=self.overrides,
+                timeout={
+                    'attemptDurationSeconds': self.execution_timeout.seconds
+                }
+            )
 
             self.log.info('AWS Batch Job started: %s', response)
 
@@ -154,19 +159,17 @@ class AWSBatchOperator(BaseOperator):
             raise AirflowException('No job found for {}'.format(response))
 
         for job in response['jobs']:
-            job_status = job['status']
-            if job_status == 'FAILED':
-                reason = job['statusReason']
-                raise AirflowException('Job failed with status {}'.format(reason))
-            elif job_status in [
-                'SUBMITTED',
-                'PENDING',
-                'RUNNABLE',
-                'STARTING',
-                'RUNNING'
-            ]:
+            if 'attempts' in job:
+                containers = job['attempts']
+                for container in containers:
+                    if (job['status'] == 'FAILED' or
+                            container['container']['exitCode'] != 0):
+                        raise AirflowException(
+                            'This containers encounter an error during '
+                            'execution {}'.format(job))
+            elif job['status'] is not 'SUCCEEDED':
                 raise AirflowException(
-                    'This task is still pending {}'.format(job_status))
+                    'This task is still pending {}'.format(job['status']))
 
     def get_hook(self):
         return AwsHook(
